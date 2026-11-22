@@ -1034,15 +1034,22 @@ async function searchTracks(input) {
   const { track, upgrade } = input;
   const { setting, hiresCapable } = await settingsTier(input);
   const deadline = Date.now() + SEARCH_BUDGET_MS;
+  // Tidal can miss "Deutschland (Live in Mexico City)" yet find it for "Rammstein Deutschland", so retry without
+  // the bracketed version, then the bare title, until a result has the requested title.
+  const base = String(track.title ?? "").replace(/\s*[([][^)\]]*[)\]]/g, "").trim();
   const queries = [[track.artist, track.title].filter(Boolean).join(" ")];
+  if (track.artist && base && base !== track.title) queries.push(`${track.artist} ${base}`);
   if (track.artist && track.title) queries.push(track.title);
-  let items = [];
+  const found = new Map();
   for (const query of queries) {
     if (!query.trim()) continue;
     const r = await api(input, "/search", { query, types: "TRACKS", limit: "50" }, { deadline });
-    items = (r.tracks?.items ?? r.items ?? []).filter(playable);
-    if (items.length) break;
+    for (const t of (r.tracks?.items ?? r.items ?? []).filter(playable)) if (!found.has(t.id)) found.set(t.id, t);
+    if ([...found.values()].some((t) => norm(trackTitle(t)) === norm(track.title))) break;
   }
+  // Exact titles first, so the 50-result cap never drops one a later query found.
+  const exact = (t) => norm(trackTitle(t)) === norm(track.title);
+  const items = [...found.values()].sort((x, y) => exact(y) - exact(x));
   const mbids = { trackMbid: track.trackMbid, artistMbid: track.artistMbid, releaseMbid: track.releaseMbid };
   const out = [];
   for (const t of items) {
