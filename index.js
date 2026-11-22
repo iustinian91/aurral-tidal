@@ -195,13 +195,23 @@ export async function api(ctx, path, params = {}, opts = {}) {
   const url = `${API}${path}?${qs}`;
   const call = (tok) => tfetch(url, { ...opts, headers: { authorization: `Bearer ${tok}` } });
   let res = await call(a.accessToken);
-  if (res.status === 401) {
+  if (res.status === 401 && (await isTokenError(res))) {
     await res.body?.cancel().catch(() => {});
     a = await getToken(ctx, { staleToken: a.accessToken });
     res = await call(a.accessToken);
   }
   if (!res.ok) throw Object.assign(await errorFrom(res, `Tidal ${path.split("/").slice(0, 2).join("/")}`), { status: res.status });
   return res.json();
+}
+
+/** Tidal token errors are subStatus 11xxx; other 401s (4005 asset not ready) won't be fixed by a refresh. */
+async function isTokenError(res) {
+  try {
+    const { subStatus } = await res.clone().json();
+    return !subStatus || Math.floor(subStatus / 1000) === 11;
+  } catch {
+    return true; // unreadable body: keep the refresh-and-retry behaviour
+  }
 }
 
 // Browser (PKCE) login for client IDs Tidal doesn't allow to use the device flow.
