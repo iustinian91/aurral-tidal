@@ -16,9 +16,30 @@ const STREAM_TOTAL_MS = 25 * 60_000;
 const JOB_DEADLINE_MS = 28 * 60_000;
 const SEARCH_BUDGET_MS = 45_000;
 const ALBUM_CONCURRENCY = 3;
+const SEGMENT_WINDOW = 4;
 const FLAC_PADDING = 8192;
+const CACHE_TTL_MS = 10 * 60_000;
+const SEARCH_TTL_MS = 5 * 60_000;
+const CACHE_MAX = 200;
 
 export const _config = { baseDelayMs: 1000 };
+
+// The process lives until 5 idle minutes, so this saves repeat requests within a burst of jobs.
+const memo = new Map();
+
+/** Returns fn()'s promise, shared by every caller for `ttl` ms. A rejection is not cached. */
+function cached(key, ttl, fn) {
+  const hit = memo.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.value;
+  const value = fn();
+  memo.delete(key);
+  memo.set(key, { value, expiresAt: Date.now() + ttl });
+  while (memo.size > CACHE_MAX) memo.delete(memo.keys().next().value);
+  value.catch(() => memo.get(key)?.value === value && memo.delete(key));
+  return value;
+}
+
+export const _resetCaches = () => memo.clear();
 
 // ---------------------------------------------------------------- utilities
 
@@ -110,11 +131,19 @@ const loginRequired = () =>
 
 const authFile = (ctx) => join(ctx.dataFolder, "auth.json");
 
+// Last record read or written per auth file; this process is the file's only writer.
+const authMemo = new Map();
+
 export async function loadAuth(ctx) {
   const clientId = String(ctx.settings.clientId ?? "");
+  const file = resolve(authFile(ctx));
   try {
-    const a = JSON.parse(await readFile(authFile(ctx), "utf8"));
-    if (a && a.clientId === clientId) return a;
+    let a = authMemo.get(file);
+    if (!a) {
+      a = JSON.parse(await readFile(file, "utf8"));
+      if (a) authMemo.set(file, a);
+    }
+    if (a && a.clientId === clientId) return { ...a };
   } catch {}
   return { clientId };
 }
@@ -124,6 +153,7 @@ export async function saveAuth(ctx, a) {
   const tmp = `${authFile(ctx)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
   await writeFile(tmp, JSON.stringify(a), { mode: 0o600 });
   await rename(tmp, authFile(ctx));
+  authMemo.set(resolve(authFile(ctx)), JSON.parse(JSON.stringify(a)));
 }
 
 async function updateAuth(ctx, patch) {
@@ -843,26 +873,59 @@ async function bestEffort(what, fn) {
   }
 }
 
-function getAlbum(ctx, id, cache, signal) {
-  if (!cache.albums.has(id)) {
-    const p = api(ctx, `/albums/${id}`, {}, { signal });
-    p.catch(() => cache.albums.delete(id));
-    cache.albums.set(id, p);
-  }
-  return cache.albums.get(id);
+// Cached requests are shared across jobs, so they take no job signal and rely on their own timeouts.
+const scope = (ctx) => `${resolve(ctx.dataFolder)}|${String(ctx.settings.countryCode ?? "").trim().toUpperCase()}`;
+
+function getAlbum(ctx, id) {
+  return cached(`${scope(ctx)}|album|${id}`, CACHE_TTL_MS, () => api(ctx, `/albums/${id}`));
 }
 
-function getCover(ctx, album, cache, signal) {
+function getCover(ctx, album) {
   if (ctx.settings.skipCover || !album.cover) return null;
-  if (!cache.covers.has(album.id)) {
-    const size = coverSizeOf(ctx.settings);
-    const url = `https://resources.tidal.com/images/${album.cover.replace(/-/g, "/")}/${size}x${size}.jpg`;
-    cache.covers.set(album.id, bestEffort("cover", () => fetchBuffer(url, signal, 20_000)));
-  }
-  return cache.covers.get(album.id);
+  const size = coverSizeOf(ctx.settings);
+  const url = `https://resources.tidal.com/images/${album.cover.replace(/-/g, "/")}/${size}x${size}.jpg`;
+  return bestEffort("cover", () => cached(`cover|${url}`, CACHE_TTL_MS, () => fetchBuffer(url, undefined, 20_000)));
 }
 
-const newCache = () => ({ albums: new Map(), covers: new Map() });
+function getLyrics(ctx, trackId) {
+  if (ctx.settings.skipLyrics) return null;
+  return bestEffort("lyrics", () =>
+    cached(`${scope(ctx)}|lyrics|${trackId}`, CACHE_TTL_MS, async () => {
+      try {
+        return (await api(ctx, `/tracks/${trackId}/lyrics`, {}, { timeout: 10_000, retries: 0 })).lyrics || null;
+      } catch (e) {
+        if (e.status === 404) return null; // remembered: most tracks have no lyrics
+        throw e;
+      }
+    }),
+  );
+}
+
+/** Fetches urls up to SEGMENT_WINDOW at a time and yields their bodies in order. */
+async function* fetchInOrder(urls, signal) {
+  const ac = new AbortController();
+  const sig = signal ? AbortSignal.any([signal, ac.signal]) : ac.signal;
+  const pending = [];
+  let next = 0;
+  const fill = () => {
+    while (next < urls.length && pending.length < SEGMENT_WINDOW) {
+      const p = fetchBuffer(urls[next++], sig);
+      p.catch(() => {});
+      pending.push(p);
+    }
+  };
+  try {
+    fill();
+    while (pending.length) {
+      const buf = await pending.shift();
+      fill();
+      yield buf;
+    }
+  } finally {
+    ac.abort(); // stop prefetches after a failure
+  }
+}
+
 const trackTitle = (t) => (t.version ? `${t.title} (${t.version})` : t.title);
 
 function buildMeta(track, album, lyrics, mbids) {
@@ -894,11 +957,11 @@ let loggedHiresCap = false;
  * Downloads one track into `directory`. `nameOf(meta, ext)` returns path parts relative to it.
  * Returns the path relative to `directory`.
  */
-async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, cache = newCache(), track } = {}) {
+async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, track } = {}) {
   const t0 = Date.now();
   track ??= await api(ctx, `/tracks/${trackId}`, {}, { signal });
   if (!track.allowStreaming || !track.streamReady) throw new Error(`"${track.title}" isn't available to stream`);
-  const [album, auth] = await Promise.all([getAlbum(ctx, track.album.id, cache, signal), loadAuth(ctx)]);
+  const [album, auth] = await Promise.all([getAlbum(ctx, track.album.id), loadAuth(ctx)]);
   const max = trackMaxQuality(track);
   let requested = effectiveQuality(parseQuality(ctx.settings.quality), max);
   if (requested === "HI_RES_LOSSLESS" && auth.hiresCapable === false) requested = "LOSSLESS";
@@ -911,10 +974,7 @@ async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, c
     loggedHiresCap = true;
   }
 
-  const [lyrics, cover] = await Promise.all([
-    ctx.settings.skipLyrics ? null : bestEffort("lyrics", async () => (await api(ctx, `/tracks/${track.id}/lyrics`, {}, { signal, timeout: 10_000, retries: 0 })).lyrics || null),
-    getCover(ctx, album, cache, signal),
-  ]);
+  const [lyrics, cover] = await Promise.all([getLyrics(ctx, track.id), getCover(ctx, album)]);
   const meta = buildMeta(track, album, lyrics, mbids);
   const tags = toVorbis(meta);
   const coverSize = coverSizeOf(ctx.settings);
@@ -953,7 +1013,7 @@ async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, c
         const fh = await open(part, "w");
         try {
           await fh.write(rx.header(tags, cover, FLAC_PADDING, coverSize));
-          for (const url of mpd.segmentUrls) await fh.write(rx.segment(await fetchBuffer(url, signal)));
+          for await (const seg of fetchInOrder(mpd.segmentUrls, signal)) await fh.write(rx.segment(seg));
           if (rx.duration) {
             const { position, bytes } = rx.patchBytes();
             await fh.write(bytes, 0, bytes.length, position);
@@ -964,7 +1024,7 @@ async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, c
       } else if (/mp4a/i.test(mpd.codecs)) {
         await target("m4a");
         const segs = [init];
-        for (const url of mpd.segmentUrls) segs.push(await fetchBuffer(url, signal));
+        for await (const seg of fetchInOrder(mpd.segmentUrls, signal)) segs.push(seg);
         await writeFile(part, writeMp4Tags(Buffer.concat(segs), meta, cover));
       } else throw new Error(`Tidal sent a stream in ${mpd.codecs || "an unknown codec"}, which the plugin can't handle`);
     } else throw new Error(`Tidal sent a ${pb.manifestMimeType} manifest, which the plugin can't read`);
@@ -1030,6 +1090,32 @@ const artistParts = (s) =>
   String(s ?? "").split(/\s*(?:,|&|\+|\/|\b(?:feat|ft)\b\.?|\b(?:featuring|presents|with|and|x|vs)\b\.?)\s*/i).map((p) => p.trim()).filter(Boolean);
 const artistNames = (s) => new Set([s, ...artistParts(s)].map(norm).filter(Boolean));
 
+/** Aurral repeats the same search across sources, upgrade passes and Manual Search. */
+const searchApi = (ctx, params, deadline) =>
+  cached(`${scope(ctx)}|search|${new URLSearchParams(params)}`, SEARCH_TTL_MS, () => api(ctx, "/search", params, { deadline }));
+
+/** The fields downloadTrack reads, carried in result.data so download needs no /tracks/{id} call. */
+const trackSnapshot = (t) => ({
+  id: t.id,
+  title: t.title,
+  version: t.version,
+  duration: t.duration,
+  allowStreaming: t.allowStreaming,
+  streamReady: t.streamReady,
+  audioQuality: t.audioQuality,
+  mediaMetadata: t.mediaMetadata,
+  artist: t.artist,
+  artists: t.artists,
+  album: t.album && { id: t.album.id, title: t.album.title, cover: t.album.cover },
+  trackNumber: t.trackNumber,
+  volumeNumber: t.volumeNumber,
+  isrc: t.isrc,
+  copyright: t.copyright,
+  replayGain: t.replayGain,
+  peak: t.peak,
+  streamStartDate: t.streamStartDate,
+});
+
 async function searchTracks(input) {
   const { track, upgrade } = input;
   const { setting, hiresCapable } = await settingsTier(input);
@@ -1040,15 +1126,18 @@ async function searchTracks(input) {
   const queries = [[track.artist, track.title].filter(Boolean).join(" ")];
   if (track.artist && base && base !== track.title) queries.push(`${track.artist} ${base}`);
   if (track.artist && track.title) queries.push(track.title);
+  // The bare-title query returns other artists' songs, so an exact title only counts when it's by the requested artist.
+  const wanted = artistNames(track.artist);
+  const exact = (t) =>
+    norm(trackTitle(t)) === norm(track.title) && (!wanted.size || [t.artist, ...(t.artists ?? [])].some((a) => a && wanted.has(norm(a.name))));
   const found = new Map();
   for (const query of queries) {
     if (!query.trim()) continue;
-    const r = await api(input, "/search", { query, types: "TRACKS", limit: "50" }, { deadline });
+    const r = await searchApi(input, { query, types: "TRACKS", limit: "50" }, deadline);
     for (const t of (r.tracks?.items ?? r.items ?? []).filter(playable)) if (!found.has(t.id)) found.set(t.id, t);
-    if ([...found.values()].some((t) => norm(trackTitle(t)) === norm(track.title))) break;
+    if ([...found.values()].some(exact)) break;
   }
   // Exact titles first, so the 50-result cap never drops one a later query found.
-  const exact = (t) => norm(trackTitle(t)) === norm(track.title);
   const items = [...found.values()].sort((x, y) => exact(y) - exact(x));
   const mbids = { trackMbid: track.trackMbid, artistMbid: track.artistMbid, releaseMbid: track.releaseMbid };
   const out = [];
@@ -1065,7 +1154,7 @@ async function searchTracks(input) {
       durationMs: t.duration ? t.duration * 1000 : null,
       format: tier.format,
       bitrate: tier.bitrate,
-      data: { trackId: t.id, albumId: t.album?.id ?? null, mbids: matchesRequest(t, track) ? mbids : null },
+      data: { trackId: t.id, albumId: t.album?.id ?? null, mbids: matchesRequest(t, track) ? mbids : null, track: t.album?.id ? trackSnapshot(t) : undefined },
     });
   }
   return out.slice(0, 50);
@@ -1076,7 +1165,7 @@ async function download(input) {
   const trackId = result.data?.trackId ?? result.id;
   const mbids = result.data?.mbids;
   return withDeadline(JOB_DEADLINE_MS, "Download took longer than 28 minutes", async (ac) => {
-    const path = await downloadTrack(input, trackId, directory, (m, ext) => [`${safeName(`${m.artist} - ${m.title}`)}.${ext}`], { signal: ac.signal, mbids });
+    const path = await downloadTrack(input, trackId, directory, (m, ext) => [`${safeName(`${m.artist} - ${m.title}`)}.${ext}`], { signal: ac.signal, mbids, track: result.data?.track });
     return { path };
   });
 }
@@ -1097,7 +1186,7 @@ async function searchAlbum(input) {
   const deadline = Date.now() + SEARCH_BUDGET_MS;
   const found = new Map();
   for (const q of queries) {
-    const r = await api(input, "/search", { query: q, types: "ALBUMS", limit: "50" }, { deadline });
+    const r = await searchApi(input, { query: q, types: "ALBUMS", limit: "50" }, deadline);
     for (const a of (r.albums?.items ?? r.items ?? []).filter(playable).filter(byArtist)) if (!found.has(a.id)) found.set(a.id, a);
     if ([...found.values()].some(titled)) break;
   }
@@ -1137,7 +1226,6 @@ async function downloadAlbum(input) {
   const pad = (n) => String(n ?? 0).padStart(2, "0");
   try {
     await withDeadline(JOB_DEADLINE_MS, "Album took longer than 28 minutes", async (ac) => {
-      const cache = newCache();
       const tracks = (await albumTracks(input, albumId, ac.signal)).filter(playable);
       if (!tracks.length) throw new Error("This album has no tracks available to stream");
       let next = 0;
@@ -1148,7 +1236,6 @@ async function downloadAlbum(input) {
           try {
             await downloadTrack(input, t.id, directory, (m, ext) => [`Disc ${m.discNumber || 1}`, `${pad(m.trackNumber)} - ${safeName(m.title)}.${ext}`], {
               signal: ac.signal,
-              cache,
               track: t,
             });
           } catch (e) {

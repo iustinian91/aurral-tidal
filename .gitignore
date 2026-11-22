@@ -1,0 +1,5 @@
+# Only the plugin itself is published
+/*
+!/.gitignore
+!/manifest.json
+!/index.js
