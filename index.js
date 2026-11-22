@@ -1026,8 +1026,9 @@ export function matchesRequest(t, track) {
 }
 
 /** The requested artist, whole and split on joiners ("Timbaland Presents OneRepublic" → both). */
-const artistNames = (s) =>
-  new Set([s, ...String(s ?? "").split(/\s*(?:,|&|\+|\/|\b(?:feat|ft)\b\.?|\b(?:featuring|presents|with|and|x|vs)\b\.?)\s*/i)].map(norm).filter(Boolean));
+const artistParts = (s) =>
+  String(s ?? "").split(/\s*(?:,|&|\+|\/|\b(?:feat|ft)\b\.?|\b(?:featuring|presents|with|and|x|vs)\b\.?)\s*/i).map((p) => p.trim()).filter(Boolean);
+const artistNames = (s) => new Set([s, ...artistParts(s)].map(norm).filter(Boolean));
 
 async function searchTracks(input) {
   const { track, upgrade } = input;
@@ -1077,12 +1078,24 @@ async function searchAlbum(input) {
   const { setting, hiresCapable } = await settingsTier(input);
   const query = [album.artist, album.title].filter(Boolean).join(" ").trim();
   if (!query) return [];
-  const r = await api(input, "/search", { query, types: "ALBUMS", limit: "50" }, { deadline: Date.now() + SEARCH_BUDGET_MS });
-  // Aurral tries the first albums as listed without matching them, so drop other artists' karaoke and tribute albums here.
+  // Aurral tries the first albums as listed without matching them, so drop other artists' karaoke and tribute albums,
+  // and put albums with the requested title first.
   const wanted = artistNames(album.artist);
   const byArtist = (a) => !wanted.size || [a.artist, ...(a.artists ?? [])].some((x) => x && wanted.has(norm(x.name)));
+  const titled = (a) => !!album.title && norm(a.title) === norm(album.title);
+  // Tidal can miss the album for a joined artist ("Timbaland Presents OneRepublic"), so retry with each name on its own.
+  const parts = artistParts(album.artist);
+  const queries = [query, ...(album.title && parts.length > 1 ? parts.map((p) => `${p} ${album.title}`) : [])];
+  const deadline = Date.now() + SEARCH_BUDGET_MS;
+  const found = new Map();
+  for (const q of queries) {
+    const r = await api(input, "/search", { query: q, types: "ALBUMS", limit: "50" }, { deadline });
+    for (const a of (r.albums?.items ?? r.items ?? []).filter(playable).filter(byArtist)) if (!found.has(a.id)) found.set(a.id, a);
+    if ([...found.values()].some(titled)) break;
+  }
+  const albums = [...found.values()].sort((x, y) => titled(y) - titled(x));
   const out = [];
-  for (const a of (r.albums?.items ?? r.items ?? []).filter(playable).filter(byArtist)) {
+  for (const a of albums) {
     const tier = advertisedTier(a, setting, hiresCapable);
     if (!tier) continue;
     if (upgrade && !isBetter(tier.tier, upgrade.currentTier)) continue;
