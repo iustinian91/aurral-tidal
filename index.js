@@ -1052,7 +1052,8 @@ async function searchTracks(input) {
     out.push({
       id: String(t.id),
       title: trackTitle(t),
-      artist: t.artist?.name || t.artists?.[0]?.name || "",
+      // Aurral splits the credit on commas and matches any name, so a duet matches either artist.
+      artist: [...new Set((t.artists ?? []).map((a) => a?.name).filter(Boolean))].join(", ") || t.artist?.name || "",
       album: t.album?.title ?? null,
       durationMs: t.duration ? t.duration * 1000 : null,
       format: tier.format,
