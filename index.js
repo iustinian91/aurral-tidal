@@ -1025,6 +1025,10 @@ export function matchesRequest(t, track) {
   return !(t.duration && track.durationMs) || Math.abs(t.duration * 1000 - track.durationMs) <= 3000;
 }
 
+/** The requested artist, whole and split on joiners ("Timbaland Presents OneRepublic" → both). */
+const artistNames = (s) =>
+  new Set([s, ...String(s ?? "").split(/\s*(?:,|&|\+|\/|\b(?:feat|ft)\b\.?|\b(?:featuring|presents|with|and|x|vs)\b\.?)\s*/i)].map(norm).filter(Boolean));
+
 async function searchTracks(input) {
   const { track, upgrade } = input;
   const { setting, hiresCapable } = await settingsTier(input);
@@ -1074,8 +1078,11 @@ async function searchAlbum(input) {
   const query = [album.artist, album.title].filter(Boolean).join(" ").trim();
   if (!query) return [];
   const r = await api(input, "/search", { query, types: "ALBUMS", limit: "50" }, { deadline: Date.now() + SEARCH_BUDGET_MS });
+  // Aurral tries the first albums as listed without matching them, so drop other artists' karaoke and tribute albums here.
+  const wanted = artistNames(album.artist);
+  const byArtist = (a) => !wanted.size || [a.artist, ...(a.artists ?? [])].some((x) => x && wanted.has(norm(x.name)));
   const out = [];
-  for (const a of (r.albums?.items ?? r.items ?? []).filter(playable)) {
+  for (const a of (r.albums?.items ?? r.items ?? []).filter(playable).filter(byArtist)) {
     const tier = advertisedTier(a, setting, hiresCapable);
     if (!tier) continue;
     if (upgrade && !isBetter(tier.tier, upgrade.currentTier)) continue;
