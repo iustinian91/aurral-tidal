@@ -24,9 +24,10 @@ Or copy `index.js` and `manifest.json` into a `tidal` folder inside the `plugins
 
 ## Set up
 
-1. Enter a **Client ID** and **Client secret** for a Tidal API client (for example the one tiddl or tidal-dl-ng uses), then save.
-2. Press **Test** and sign in to Tidal as prompted.
-3. If your client ID logs in through the browser, paste the address of the page you land on into **Login URL**, save, and press **Test** again.
+1. Press **Test**, open the link it shows and approve the login.
+2. Press **Test** again to finish connecting.
+
+The plugin logs in with a built-in Tidal client (the same one tiddl uses), so you don't need a client ID. The built-in client tops out at `LOSSLESS`: for Hi-Res, enter your own **Client ID** (a **Client secret** is only needed if your client has one) before pressing **Test**. If that client ID logs in through the browser, paste the address of the page you land on into **Login URL**, save, and press **Test** again.
 
 ## Settings
 
@@ -42,5 +43,6 @@ Quality and cover size are typed in, because Aurral settings have no dropdown ty
 
 ## Notes
 
-- You need an active Tidal subscription. Hi-Res depends on your account and client ID; if Tidal doesn't deliver it, results are capped at `LOSSLESS`.
+- You need an active Tidal subscription. Hi-Res depends on your account and client ID (the built-in client doesn't get it); if Tidal doesn't deliver it, results are capped at `LOSSLESS`.
+- Tidal can revoke the built-in client at any time. If logins start failing, enter your own **Client ID**.
 - The plugin connects to `api.tidal.com`, `auth.tidal.com`, `login.tidal.com` and `resources.tidal.com`.

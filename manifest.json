@@ -6,8 +6,8 @@
   "description": "Downloads tracks and albums from your Tidal account in Hi-Res FLAC, FLAC or AAC 320, with tags, cover art and lyrics written into each file.",
   "uses": ["api.tidal.com", "auth.tidal.com", "login.tidal.com", "resources.tidal.com", "Your Tidal account"],
   "settings": [
-    { "key": "clientId", "label": "Client ID", "type": "text", "required": true, "help": "Tidal API client ID used to log in, for example the one tiddl or tidal-dl-ng uses." },
-    { "key": "clientSecret", "label": "Client secret", "type": "password", "required": true, "help": "The secret that goes with the Client ID. After saving, press Test to log in to Tidal." },
+    { "key": "clientId", "label": "Client ID", "type": "text", "help": "Leave empty to use the built-in client (the one tiddl uses), which tops out at LOSSLESS. Enter your own Tidal API client ID for Hi-Res." },
+    { "key": "clientSecret", "label": "Client secret", "type": "password", "help": "Only if your own Client ID has a secret. Leave empty otherwise." },
     { "key": "loginUrl", "label": "Login URL", "type": "text", "help": "Only for client IDs that log in through the browser: after pressing Test and signing in, paste the address of the page you land on here, save, and press Test again." },
     { "key": "quality", "label": "Quality", "type": "text", "help": "Type exactly one of: HI_RES_LOSSLESS (FLAC up to 24-bit/192 kHz), LOSSLESS (FLAC 16-bit/44.1 kHz) or HIGH (AAC 320). Empty means LOSSLESS; anything else fails the download. A track that lacks the quality comes in the best one it has." },
     { "key": "countryCode", "label": "Country code", "type": "text", "help": "Two-letter catalog country, like US. Empty uses your Tidal account's country." },

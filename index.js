@@ -126,6 +126,13 @@ export function safeJoin(directory, ...parts) {
 
 // ---------------------------------------------------------------- auth
 
+// Same built-in client as tiddl (Tidal's own app); used when Client ID is left empty.
+const DEFAULT_CLIENT = Buffer.from("NE4zbjZRMXg5NUxMNUs3cDtvS09YZkpXMzcxY1g2eGFaMFB5aGdHTkJkTkxsQlpkNEFLS1lvdWdNamlrPQ==", "base64")
+  .toString()
+  .split(";");
+const clientId = (ctx) => String(ctx.settings.clientId ?? "").trim() || DEFAULT_CLIENT[0];
+const clientSecret = (ctx) => (String(ctx.settings.clientId ?? "").trim() ? String(ctx.settings.clientSecret ?? "") : DEFAULT_CLIENT[1]);
+
 const loginRequired = () =>
   Object.assign(new Error("Not logged in to Tidal. Press Test on the plugin page to log in to Tidal."), { loginRequired: true });
 
@@ -135,7 +142,7 @@ const authFile = (ctx) => join(ctx.dataFolder, "auth.json");
 const authMemo = new Map();
 
 export async function loadAuth(ctx) {
-  const clientId = String(ctx.settings.clientId ?? "");
+  const id = clientId(ctx);
   const file = resolve(authFile(ctx));
   try {
     let a = authMemo.get(file);
@@ -143,9 +150,9 @@ export async function loadAuth(ctx) {
       a = JSON.parse(await readFile(file, "utf8"));
       if (a) authMemo.set(file, a);
     }
-    if (a && a.clientId === clientId) return { ...a };
+    if (a && a.clientId === id) return { ...a };
   } catch {}
-  return { clientId };
+  return { clientId: id };
 }
 
 export async function saveAuth(ctx, a) {
@@ -163,7 +170,8 @@ async function updateAuth(ctx, patch) {
 }
 
 function basic(ctx) {
-  return "Basic " + Buffer.from(`${ctx.settings.clientId}:${ctx.settings.clientSecret}`).toString("base64");
+  if (!clientSecret(ctx)) return undefined; // public clients (browser login) have no secret
+  return "Basic " + Buffer.from(`${clientId(ctx)}:${clientSecret(ctx)}`).toString("base64");
 }
 
 function postForm(url, fields, auth) {
@@ -193,7 +201,7 @@ export async function getToken(ctx, { staleToken } = {}) {
 async function refresh(ctx, a) {
   const res = await postForm(
     `${AUTH}/token`,
-    { client_id: ctx.settings.clientId, refresh_token: a.refreshToken, grant_type: "refresh_token", scope: SCOPE },
+    { client_id: clientId(ctx), refresh_token: a.refreshToken, grant_type: "refresh_token", scope: SCOPE },
     basic(ctx),
   );
   if (res.status === 400 || res.status === 401) {
@@ -252,7 +260,7 @@ function pkceUrl(ctx, pkce) {
   const q = new URLSearchParams({
     response_type: "code",
     redirect_uri: PKCE_REDIRECT,
-    client_id: ctx.settings.clientId,
+    client_id: clientId(ctx),
     lang: "EN",
     appMode: "android",
     client_unique_key: pkce.uniqueKey,
@@ -284,7 +292,7 @@ function loginCode(settings) {
 async function exchangePkce(ctx, a, code) {
   const res = await postForm(`${AUTH}/token`, {
     code,
-    client_id: ctx.settings.clientId,
+    client_id: clientId(ctx),
     grant_type: "authorization_code",
     redirect_uri: PKCE_REDIRECT,
     scope: SCOPE,
@@ -311,7 +319,7 @@ async function saveTokens(ctx, a, j) {
 }
 
 async function startDevice(ctx, a) {
-  const res = await postForm(`${AUTH}/device_authorization`, { client_id: ctx.settings.clientId, scope: SCOPE });
+  const res = await postForm(`${AUTH}/device_authorization`, { client_id: clientId(ctx), scope: SCOPE });
   if (res.status === 400 || res.status === 401) {
     const err = await errorFrom(res, "Tidal login");
     if (/limited input device/i.test(err.message)) return startPkce(ctx, a);
@@ -351,7 +359,7 @@ async function test(ctx) {
   if (!a.device || a.device.expiresAt <= Date.now()) return startDevice(ctx, a);
   const res = await postForm(
     `${AUTH}/token`,
-    { client_id: ctx.settings.clientId, device_code: a.device.deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code", scope: SCOPE },
+    { client_id: clientId(ctx), device_code: a.device.deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code", scope: SCOPE },
     basic(ctx),
   );
   const j = await res.json().catch(() => ({}));
