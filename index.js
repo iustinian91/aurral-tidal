@@ -42,6 +42,7 @@ function cached(key, ttl, fn) {
 export const _resetCaches = () => {
   memo.clear();
   profileFailure = { at: 0, reason: "" };
+  lastProfile = { url: "", profile: null };
 };
 
 // ---------------------------------------------------------------- utilities
@@ -1102,6 +1103,8 @@ async function clearDirectory(directory) {
 const PROFILE_TTL_MS = 5 * 60_000;
 const PROFILE_BACKOFF_MS = 60_000;
 let profileFailure = { at: 0, reason: "" };
+// The last profile read, used when a reread fails so a short outage doesn't change quality mid-album.
+let lastProfile = { url: "", profile: null };
 
 const profileKey = (conn) => `aurral|${conn.url}|qualityProfile`;
 
@@ -1124,20 +1127,24 @@ function aurralProfile(ctx) {
 async function qualityPlan(ctx) {
   const { hiresCapable } = await loadAuth(ctx);
   const typed = (error) => ({ wanted: typedWanted(ctx.settings.quality), hiresCapable, profile: null, source: "Quality setting", error });
+  const fromProfile = (profile, error) => ({ wanted: profileWanted(profile), hiresCapable, profile, source: "Aurral profile", error });
+  const fallback = (error) =>
+    lastProfile.profile && lastProfile.url === ctx.api?.url ? fromProfile(lastProfile.profile, error) : typed(error);
   if (!ctx.settings.autoQuality) return typed();
-  if (Date.now() - profileFailure.at < PROFILE_BACKOFF_MS) return typed(profileFailure.reason);
+  if (Date.now() - profileFailure.at < PROFILE_BACKOFF_MS) return fallback(profileFailure.reason);
   try {
     const profile = await aurralProfile(ctx);
-    return { wanted: profileWanted(profile), hiresCapable, profile, source: "Aurral profile" };
+    lastProfile = { url: ctx.api.url, profile };
+    return fromProfile(profile);
   } catch (e) {
     // Parallel callers share one failed request: log it once.
     if (Date.now() - profileFailure.at >= PROFILE_BACKOFF_MS) {
       profileFailure = { at: Date.now(), reason: e.message };
-      const fallback = typed(e.message);
-      console.log(`[tidal] Couldn't read Aurral's quality profile (${e.message}); using Quality ${fallback.wanted[0]}`);
-      return fallback;
+      const plan = fallback(e.message);
+      console.log(`[tidal] Couldn't read Aurral's quality profile (${e.message}); ${plan.profile ? "using the last one read" : `using Quality ${plan.wanted[0]}`}`);
+      return plan;
     }
-    return typed(profileFailure.reason);
+    return fallback(profileFailure.reason);
   }
 }
 
@@ -1156,7 +1163,8 @@ async function qualityLine(ctx) {
   }
   const first = plan.wanted.find((q) => !(q === "HI_RES_LOSSLESS" && plan.hiresCapable === false));
   if (plan.profile) {
-    return first ? `Quality: Aurral profile (${first} first)` : "Quality: Aurral profile — no Tidal quality is enabled, so searches return nothing";
+    const stale = plan.error ? ` — couldn't reread it (${plan.error}), so using the last one read` : "";
+    return (first ? `Quality: Aurral profile (${first} first)` : "Quality: Aurral profile — no Tidal quality is enabled, so searches return nothing") + stale;
   }
   return `Quality: Quality setting (${first})${plan.error ? ` — couldn't read Aurral's profile: ${plan.error}` : ""}`;
 }

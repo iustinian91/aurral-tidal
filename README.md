@@ -34,7 +34,7 @@ The plugin logs in with a built-in Tidal client (the same one tiddl uses), so yo
 | Setting | Values | Default |
 |---|---|---|
 | Follow Aurral's quality profile | on / off. On: the plugin asks Tidal for the qualities your Aurral quality profile enables, in its order, and judges upgrades the way Aurral does | off |
-| Quality | `HI_RES_LOSSLESS`, `LOSSLESS` or `HIGH`. With the profile setting on, used only when Aurral's profile can't be read | `LOSSLESS` |
+| Quality | `HI_RES_LOSSLESS`, `LOSSLESS` or `HIGH`. With the profile setting on, used only until Aurral's profile has been read once (after that, a failed read keeps the last profile) | `LOSSLESS` |
 | Country code | Two letters, like `US` | Your Tidal account's country |
 | Cover size | `80`, `160`, `320`, `640` or `1280` pixels | `1280` |
 | Don't embed cover art | on / off | off |
