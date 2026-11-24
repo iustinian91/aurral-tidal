@@ -33,7 +33,8 @@ The plugin logs in with a built-in Tidal client (the same one tiddl uses), so yo
 
 | Setting | Values | Default |
 |---|---|---|
-| Quality | `HI_RES_LOSSLESS`, `LOSSLESS` or `HIGH` | `LOSSLESS` |
+| Follow Aurral's quality profile | on / off. On: the plugin asks Tidal for the qualities your Aurral quality profile enables, in its order, and judges upgrades the way Aurral does | off |
+| Quality | `HI_RES_LOSSLESS`, `LOSSLESS` or `HIGH`. With the profile setting on, used only when Aurral's profile can't be read | `LOSSLESS` |
 | Country code | Two letters, like `US` | Your Tidal account's country |
 | Cover size | `80`, `160`, `320`, `640` or `1280` pixels | `1280` |
 | Don't embed cover art | on / off | off |
@@ -46,3 +47,4 @@ Quality and cover size are typed in, because Aurral settings have no dropdown ty
 - You need an active Tidal subscription. Hi-Res depends on your account and client ID (the built-in client doesn't get it); if Tidal doesn't deliver it, results are capped at `LOSSLESS`.
 - Tidal can revoke the built-in client at any time. If logins start failing, enter your own **Client ID**.
 - The plugin connects to `api.tidal.com`, `auth.tidal.com`, `login.tidal.com` and `resources.tidal.com`.
+- The plugin asks for API access, which gives it an admin key to Aurral. It uses the key only to read your quality profile from Aurral's settings (when **Follow Aurral's quality profile** is on). That answer also holds other services' keys and passwords; the plugin keeps only the quality profile. **Test** shows which quality source is in use.

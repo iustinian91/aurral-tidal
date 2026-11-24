@@ -39,7 +39,10 @@ function cached(key, ttl, fn) {
   return value;
 }
 
-export const _resetCaches = () => memo.clear();
+export const _resetCaches = () => {
+  memo.clear();
+  profileFailure = { at: 0, reason: "" };
+};
 
 // ---------------------------------------------------------------- utilities
 
@@ -339,7 +342,8 @@ async function connected(ctx) {
   const s = await api(ctx, "/sessions");
   const a = await loadAuth(ctx);
   if (s.countryCode && s.countryCode !== a.countryCode) await updateAuth(ctx, { countryCode: s.countryCode });
-  return { message: `Connected to Tidal as ${a.username || s.userId || a.userId}, country ${countryOf(ctx, { countryCode: s.countryCode || a.countryCode })}` };
+  const quality = await qualityLine(ctx);
+  return { message: `Connected to Tidal as ${a.username || s.userId || a.userId}, country ${countryOf(ctx, { countryCode: s.countryCode || a.countryCode })}. ${quality}` };
 }
 
 async function test(ctx) {
@@ -420,11 +424,36 @@ export function isBetter(a, b) {
   return ia !== -1 && (ib === -1 || ia < ib);
 }
 
-/** Quality, tier, format and bitrate to advertise for a track or album, or null when below HIGH. */
-export function advertisedTier(item, setting, hiresCapable) {
-  let q = effectiveQuality(setting, trackMaxQuality(item));
-  if (q === "HI_RES_LOSSLESS" && hiresCapable === false) q = "LOSSLESS";
-  return TIER_INFO[q] ? { quality: q, ...TIER_INFO[q] } : null;
+const TIDAL_QUALITIES = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"];
+const QUALITY_OF_TIER = Object.fromEntries(Object.entries(TIER_INFO).map(([q, i]) => [i.tier, q]));
+
+/** The typed Quality followed by every quality below it, best first. */
+export const typedWanted = (s) => {
+  const q = parseQuality(s);
+  return TIDAL_QUALITIES.filter((x) => RANK[x] <= RANK[q]);
+};
+
+/** The Tidal qualities Aurral's profile enables, in the profile's order. */
+export const profileWanted = (profile) =>
+  profile.order.filter((t) => profile.enabled.includes(t) && QUALITY_OF_TIER[t]).map((t) => QUALITY_OF_TIER[t]);
+
+/** The first wanted quality the item has (hi-res skipped when the account lacks it), or null. */
+export const pickQuality = (wanted, max, hiresCapable) =>
+  wanted.find((q) => RANK[q] <= RANK[max] && !(q === "HI_RES_LOSSLESS" && hiresCapable === false)) ?? null;
+
+/** Port of Aurral's isQualityUpgrade (qualityProfileModel.ts); update together. */
+export function isUpgrade(tier, currentTier, profile) {
+  const { order, enabled, cutoff } = profile;
+  if (!enabled.includes(tier)) return false;
+  if (!currentTier) return order.indexOf(tier) !== -1 && order.indexOf(tier) <= order.indexOf(cutoff);
+  if (!enabled.includes(currentTier)) return true;
+  return order.indexOf(tier) < order.indexOf(currentTier);
+}
+
+/** Quality, tier, format and bitrate to advertise for a track or album, or null when no wanted quality fits. */
+export function advertisedTier(item, wanted, hiresCapable) {
+  const q = pickQuality(wanted, trackMaxQuality(item), hiresCapable);
+  return q ? { quality: q, ...TIER_INFO[q] } : null;
 }
 
 // ---------------------------------------------------------------- ISO BMFF boxes
@@ -971,8 +1000,9 @@ async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, t
   if (!track.allowStreaming || !track.streamReady) throw new Error(`"${track.title}" isn't available to stream`);
   const [album, auth] = await Promise.all([getAlbum(ctx, track.album.id), loadAuth(ctx)]);
   const max = trackMaxQuality(track);
-  let requested = effectiveQuality(parseQuality(ctx.settings.quality), max);
-  if (requested === "HI_RES_LOSSLESS" && auth.hiresCapable === false) requested = "LOSSLESS";
+  // No error when nothing wanted fits: an album downloads every track, and Aurral judges each file against its profile.
+  const capped = max === "HI_RES_LOSSLESS" && auth.hiresCapable === false ? "LOSSLESS" : max;
+  const requested = pickQuality((await qualityPlan(ctx)).wanted, max, auth.hiresCapable) ?? capped;
 
   const pb = await api(ctx, `/tracks/${track.id}/playbackinfopostpaywall`, { audioquality: requested, playbackmode: "STREAM", assetpresentation: "FULL" }, { signal });
   const delivered = pb.audioQuality;
@@ -1069,10 +1099,66 @@ async function clearDirectory(directory) {
 
 // ---------------------------------------------------------------- download source
 
-async function settingsTier(ctx) {
-  const setting = parseQuality(ctx.settings.quality);
+const PROFILE_TTL_MS = 5 * 60_000;
+const PROFILE_BACKOFF_MS = 60_000;
+let profileFailure = { at: 0, reason: "" };
+
+const profileKey = (conn) => `aurral|${conn.url}|qualityProfile`;
+
+/** Aurral's quality profile from its admin `/settings`; nothing else in that answer (it holds other services' secrets) is kept. */
+function aurralProfile(ctx) {
+  const conn = ctx.api;
+  if (!conn?.url || !conn?.key) return Promise.reject(new Error("API access is off"));
+  return cached(profileKey(conn), PROFILE_TTL_MS, async () => {
+    const res = await tfetch(`${conn.url.replace(/\/+$/, "")}/settings`, { headers: { "X-Api-Key": conn.key }, timeout: 5000, retries: 0 });
+    if (!res.ok) throw await errorFrom(res, "Aurral");
+    const p = (await res.json().catch(() => null))?.qualityProfile;
+    if (!p || typeof p !== "object" || !Array.isArray(p.order) || !Array.isArray(p.enabled) || typeof p.cutoff !== "string") {
+      throw new Error("Aurral's answer has no valid quality profile");
+    }
+    return { order: p.order, enabled: p.enabled, cutoff: p.cutoff };
+  });
+}
+
+/** Which qualities to ask for, best first, and where that choice came from. */
+async function qualityPlan(ctx) {
   const { hiresCapable } = await loadAuth(ctx);
-  return { setting, hiresCapable };
+  const typed = (error) => ({ wanted: typedWanted(ctx.settings.quality), hiresCapable, profile: null, source: "Quality setting", error });
+  if (!ctx.settings.autoQuality) return typed();
+  if (Date.now() - profileFailure.at < PROFILE_BACKOFF_MS) return typed(profileFailure.reason);
+  try {
+    const profile = await aurralProfile(ctx);
+    return { wanted: profileWanted(profile), hiresCapable, profile, source: "Aurral profile" };
+  } catch (e) {
+    // Parallel callers share one failed request: log it once.
+    if (Date.now() - profileFailure.at >= PROFILE_BACKOFF_MS) {
+      profileFailure = { at: Date.now(), reason: e.message };
+      const fallback = typed(e.message);
+      console.log(`[tidal] Couldn't read Aurral's quality profile (${e.message}); using Quality ${fallback.wanted[0]}`);
+      return fallback;
+    }
+    return typed(profileFailure.reason);
+  }
+}
+
+const upgrades = (plan, tier, currentTier) => (plan.profile ? isUpgrade(tier, currentTier, plan.profile) : isBetter(tier, currentTier));
+
+/** The Test message's quality sentence. */
+async function qualityLine(ctx) {
+  // Test rereads the profile, so a fix or a profile change shows at once.
+  profileFailure = { at: 0, reason: "" };
+  if (ctx.api?.url) memo.delete(profileKey(ctx.api));
+  let plan;
+  try {
+    plan = await qualityPlan(ctx);
+  } catch (e) {
+    return `Quality: ${e.message}`;
+  }
+  const first = plan.wanted.find((q) => !(q === "HI_RES_LOSSLESS" && plan.hiresCapable === false));
+  if (plan.profile) {
+    return first ? `Quality: Aurral profile (${first} first)` : "Quality: Aurral profile — no Tidal quality is enabled, so searches return nothing";
+  }
+  return `Quality: Quality setting (${first})${plan.error ? ` — couldn't read Aurral's profile: ${plan.error}` : ""}`;
 }
 
 const playable = (x) => x && x.allowStreaming && x.streamReady;
@@ -1126,7 +1212,7 @@ const trackSnapshot = (t) => ({
 
 async function searchTracks(input) {
   const { track, upgrade } = input;
-  const { setting, hiresCapable } = await settingsTier(input);
+  const plan = await qualityPlan(input);
   const deadline = Date.now() + SEARCH_BUDGET_MS;
   // Tidal can miss "Deutschland (Live in Mexico City)" yet find it for "Rammstein Deutschland", so retry without
   // the bracketed version, then the bare title, until a result has the requested title.
@@ -1150,9 +1236,9 @@ async function searchTracks(input) {
   const mbids = { trackMbid: track.trackMbid, artistMbid: track.artistMbid, releaseMbid: track.releaseMbid };
   const out = [];
   for (const t of items) {
-    const tier = advertisedTier(t, setting, hiresCapable);
+    const tier = advertisedTier(t, plan.wanted, plan.hiresCapable);
     if (!tier) continue;
-    if (upgrade && !isBetter(tier.tier, upgrade.currentTier)) continue;
+    if (upgrade && !upgrades(plan, tier.tier, upgrade.currentTier)) continue;
     out.push({
       id: String(t.id),
       title: trackTitle(t),
@@ -1180,7 +1266,7 @@ async function download(input) {
 
 async function searchAlbum(input) {
   const { album, upgrade } = input;
-  const { setting, hiresCapable } = await settingsTier(input);
+  const plan = await qualityPlan(input);
   const query = [album.artist, album.title].filter(Boolean).join(" ").trim();
   if (!query) return [];
   // Aurral tries the first albums as listed without matching them, so drop other artists' karaoke and tribute albums,
@@ -1201,9 +1287,9 @@ async function searchAlbum(input) {
   const albums = [...found.values()].sort((x, y) => titled(y) - titled(x));
   const out = [];
   for (const a of albums) {
-    const tier = advertisedTier(a, setting, hiresCapable);
+    const tier = advertisedTier(a, plan.wanted, plan.hiresCapable);
     if (!tier) continue;
-    if (upgrade && !isBetter(tier.tier, upgrade.currentTier)) continue;
+    if (upgrade && !upgrades(plan, tier.tier, upgrade.currentTier)) continue;
     out.push({
       id: String(a.id),
       title: a.version ? `${a.title} (${a.version})` : a.title,
