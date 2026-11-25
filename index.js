@@ -727,6 +727,7 @@ export function toVorbis(m) {
   const t = [];
   const add = (k, v) => v != null && v !== "" && t.push([k, String(v)]);
   add("TITLE", m.title);
+  add("SUBTITLE", m.subtitle);
   add("ARTIST", m.artist);
   for (const a of m.artists ?? []) add("ARTISTS", a);
   add("ALBUM", m.album);
@@ -781,6 +782,7 @@ function ilstItems(m, cover) {
   text("©lyr", m.lyrics);
   text("cprt", m.copyright);
   if (cover) items.push(box("covr", box("data", u32be(cover[0] === 0x89 ? 14 : 13), u32be(0), cover)));
+  free("SUBTITLE", m.subtitle);
   free("ISRC", m.isrc);
   free("BARCODE", m.upc);
   if (m.replayGain != null) free("replaygain_track_gain", fmtGain(m.replayGain));
@@ -964,15 +966,21 @@ async function* fetchInOrder(urls, signal) {
   }
 }
 
-const trackTitle = (t) => (t.version ? `${t.title} (${t.version})` : t.title);
+const trackTitle = (t) => withVersion(t.title, t.version);
 
-function buildMeta(track, album, lyrics, mbids) {
+/** `names` holds the requested track titles and album titles, so a request that has the soundtrack note keeps it. */
+function buildMeta(track, album, lyrics, mbids, names = {}) {
   const date = album.releaseDate || track.streamStartDate?.slice(0, 10) || null;
+  const albumTitle = album.title || track.album?.title;
+  const full = trackTitle(track);
+  const title = shownTitle(full, names.titles);
   return {
-    title: trackTitle(track),
+    title,
+    // The note TITLE drops, kept where Navidrome and Picard read it.
+    subtitle: title === full ? null : noteOf(full),
     artist: track.artist?.name || track.artists?.[0]?.name,
     artists: (track.artists ?? []).map((a) => a.name).filter(Boolean),
-    album: album.title || track.album?.title,
+    album: albumTitle && shownTitle(albumTitle, names.albums),
     albumArtist: album.artist?.name,
     trackNumber: track.trackNumber,
     trackTotal: album.numberOfTracks,
@@ -995,7 +1003,7 @@ let loggedHiresCap = false;
  * Downloads one track into `directory`. `nameOf(meta, ext)` returns path parts relative to it.
  * Returns the path relative to `directory`.
  */
-async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, track } = {}) {
+async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, track, names } = {}) {
   const t0 = Date.now();
   track ??= await api(ctx, `/tracks/${trackId}`, {}, { signal });
   if (!track.allowStreaming || !track.streamReady) throw new Error(`"${track.title}" isn't available to stream`);
@@ -1014,7 +1022,7 @@ async function downloadTrack(ctx, trackId, directory, nameOf, { signal, mbids, t
   }
 
   const [lyrics, cover] = await Promise.all([getLyrics(ctx, track.id), getCover(ctx, album)]);
-  const meta = buildMeta(track, album, lyrics, mbids);
+  const meta = buildMeta(track, album, lyrics, mbids, names);
   const tags = toVorbis(meta);
   const coverSize = coverSizeOf(ctx.settings);
   const manifest = Buffer.from(pb.manifest, "base64").toString("utf8");
@@ -1178,13 +1186,39 @@ const norm = (s) =>
     .toLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, "");
 
+// Tidal adds "(From The ViQueens Soundtrack)" to titles MusicBrainz leaves bare, and Aurral rejects the difference.
+// Only a bracketed From … Soundtrack / Motion Picture note goes, never one naming a version.
+const NOTE = /\s*[([]\s*from\b[^()[\]]*\b(?:soundtrack|motion picture)\b[^()[\]]*[)\]]/giu;
+const VARIANT = /\b(?:live|remix|mix|edit|version|acoustic|instrumental|demo|karaoke|remaster(?:ed)?)\b/iu;
+const stripNote = (s) => s.replace(NOTE, (g) => (VARIANT.test(g) ? g : "")).trim() || s;
+/** The notes stripNote removes, without brackets: "From The ViQueens Soundtrack". */
+const noteOf = (s) =>
+  [...s.matchAll(NOTE)].map((m) => m[0]).filter((g) => !VARIANT.test(g)).map((g) => g.trim().slice(1, -1).trim()).join("; ") || null;
+/** Tidal's title, without its soundtrack note unless a requested name has the note too. */
+const shownTitle = (full, requested = []) => (requested.some((r) => norm(r) === norm(full)) ? full : stripNote(full));
+/** Appends Tidal's version unless the title already holds it in brackets. */
+const withVersion = (title, v) =>
+  !v || [...String(title ?? "").matchAll(/[([]([^()[\]]*)[)\]]/g)].some((m) => norm(m[1]) === norm(v)) ? title : `${title} (${v})`;
+
+/** 2 when Tidal's title is the requested one verbatim, 1 when it is once the soundtrack note goes, else 0. */
+const titleMatch = (t, title) => {
+  const want = norm(title);
+  if (!want) return 0;
+  const full = trackTitle(t);
+  if (norm(full) === want) return 2;
+  return norm(shownTitle(full, [title])) === want ? 1 : 0;
+};
+
 /** True when a Tidal track is the requested recording, so the request's MusicBrainz IDs may be written into it. */
 export function matchesRequest(t, track) {
   const artist = norm(track.artist);
-  const title = norm(track.title);
-  if (!artist || !title || norm(trackTitle(t)) !== title) return false;
+  const how = titleMatch(t, track.title);
+  if (!artist || !how) return false;
   if (![t.artist, ...(t.artists ?? [])].some((a) => a && norm(a.name) === artist)) return false;
-  return !(t.duration && track.durationMs) || Math.abs(t.duration * 1000 - track.durationMs) <= 3000;
+  const known = !!(t.duration && track.durationMs);
+  // A stripped title is only trusted when both lengths confirm it.
+  if (how === 1 && !known) return false;
+  return !known || Math.abs(t.duration * 1000 - track.durationMs) <= 3000;
 }
 
 /** The requested artist, whole and split on joiners ("Timbaland Presents OneRepublic" → both). */
@@ -1230,8 +1264,9 @@ async function searchTracks(input) {
   if (track.artist && track.title) queries.push(track.title);
   // The bare-title query returns other artists' songs, so an exact title only counts when it's by the requested artist.
   const wanted = artistNames(track.artist);
+  // 2 for a verbatim title, 1 for one that matches once the soundtrack note goes, so verbatim titles sort first.
   const exact = (t) =>
-    norm(trackTitle(t)) === norm(track.title) && (!wanted.size || [t.artist, ...(t.artists ?? [])].some((a) => a && wanted.has(norm(a.name))));
+    !wanted.size || [t.artist, ...(t.artists ?? [])].some((a) => a && wanted.has(norm(a.name))) ? titleMatch(t, track.title) : 0;
   const found = new Map();
   for (const query of queries) {
     if (!query.trim()) continue;
@@ -1249,10 +1284,10 @@ async function searchTracks(input) {
     if (upgrade && !upgrades(plan, tier.tier, upgrade.currentTier)) continue;
     out.push({
       id: String(t.id),
-      title: trackTitle(t),
+      title: shownTitle(trackTitle(t), [track.title]),
       // Aurral splits the credit on commas and matches any name, so a duet matches either artist.
       artist: [...new Set((t.artists ?? []).map((a) => a?.name).filter(Boolean))].join(", ") || t.artist?.name || "",
-      album: t.album?.title ?? null,
+      album: t.album?.title ? shownTitle(t.album.title, [track.album]) : null,
       durationMs: t.duration ? t.duration * 1000 : null,
       format: tier.format,
       bitrate: tier.bitrate,
@@ -1275,7 +1310,8 @@ async function download(input) {
   const trackId = result.data?.trackId ?? result.id;
   const mbids = result.data?.mbids;
   return withDeadline(JOB_DEADLINE_MS, "Download took longer than 28 minutes", async (ac) => {
-    const path = await downloadTrack(input, trackId, directory, (m, ext) => [`${safeName(`${m.artist} - ${m.title}`)}.${ext}`], { signal: ac.signal, mbids, track: result.data?.track });
+    const names = { titles: [result.title], albums: [result.album] };
+    const path = await downloadTrack(input, trackId, directory, (m, ext) => [`${safeName(`${m.artist} - ${m.title}`)}.${ext}`], { signal: ac.signal, mbids, track: result.data?.track, names });
     return { path };
   });
 }
@@ -1289,7 +1325,7 @@ async function searchAlbum(input) {
   // and put albums with the requested title first.
   const wanted = artistNames(album.artist);
   const byArtist = (a) => !wanted.size || [a.artist, ...(a.artists ?? [])].some((x) => x && wanted.has(norm(x.name)));
-  const titled = (a) => !!album.title && norm(a.title) === norm(album.title);
+  const titled = (a) => !!album.title && norm(shownTitle(a.title, [album.title])) === norm(album.title);
   // Tidal can miss the album for a joined artist ("Timbaland Presents OneRepublic"), so retry with each name on its own.
   const parts = artistParts(album.artist);
   const queries = [query, ...(album.title && parts.length > 1 ? parts.map((p) => `${p} ${album.title}`) : [])];
@@ -1308,7 +1344,7 @@ async function searchAlbum(input) {
     if (upgrade && !upgrades(plan, tier.tier, upgrade.currentTier)) continue;
     out.push({
       id: String(a.id),
-      title: a.version ? `${a.title} (${a.version})` : a.title,
+      title: shownTitle(withVersion(a.title, a.version), [album.title]),
       artist: a.artist?.name || a.artists?.[0]?.name || "",
       year: a.releaseDate ? Number(a.releaseDate.slice(0, 4)) || null : null,
       trackCount: a.numberOfTracks ?? null,
@@ -1335,6 +1371,7 @@ async function downloadAlbum(input) {
   const { result, directory } = input;
   const albumId = result.data?.albumId ?? result.id;
   const pad = (n) => String(n ?? 0).padStart(2, "0");
+  const names = { titles: (input.album?.tracks ?? []).map((t) => t.title), albums: [input.album?.title] };
   try {
     await withDeadline(JOB_DEADLINE_MS, "Album took longer than 28 minutes", async (ac) => {
       const tracks = (await albumTracks(input, albumId, ac.signal)).filter(playable);
@@ -1348,6 +1385,7 @@ async function downloadAlbum(input) {
             await downloadTrack(input, t.id, directory, (m, ext) => [`Disc ${m.discNumber || 1}`, `${pad(m.trackNumber)} - ${safeName(m.title)}.${ext}`], {
               signal: ac.signal,
               track: t,
+              names,
             });
           } catch (e) {
             if (!failure) {
