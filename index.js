@@ -1259,7 +1259,15 @@ async function searchTracks(input) {
       data: { trackId: t.id, albumId: t.album?.id ?? null, mbids: matchesRequest(t, track) ? mbids : null, track: t.album?.id ? trackSnapshot(t) : undefined },
     });
   }
+  logSearch("Track", `${track.artist} - ${track.title}`, upgrade, found.size, out, (r) => `${r.id} ${r.artist} - ${r.title} [${r.album}] ${r.durationMs / 1000}s`);
   return out.slice(0, 50);
+}
+
+/** One line per search, so Aurral's log shows what Tidal returned when a job fails with "No suitable search results". */
+function logSearch(kind, what, upgrade, foundCount, out, describe) {
+  const up = upgrade ? `, upgrade from ${upgrade.currentTier ?? "unknown"}` : "";
+  const first = out.length ? `; first: ${describe(out[0])} ${out[0].format}` : "";
+  console.log(`[tidal] ${kind} search "${what}"${up}: Tidal found ${foundCount}, returned ${Math.min(out.length, 50)}${first}`);
 }
 
 async function download(input) {
@@ -1309,6 +1317,7 @@ async function searchAlbum(input) {
       data: { albumId: a.id },
     });
   }
+  logSearch("Album", `${album.artist} - ${album.title}`, upgrade, found.size, out, (r) => `${r.id} ${r.artist} - ${r.title} (${r.trackCount} tracks)`);
   return out.slice(0, 50);
 }
 
