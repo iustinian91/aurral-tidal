@@ -415,8 +415,6 @@ export function trackMaxQuality(t) {
   return "LOW";
 }
 
-export const effectiveQuality = (setting, max) => (RANK[setting] <= RANK[max] ? setting : max);
-
 export function isBetter(a, b) {
   if (!a) return false;
   if (b == null) return true;
@@ -981,7 +979,7 @@ function buildMeta(track, album, lyrics, mbids, names = {}, numbered = true) {
   return {
     title,
     // The note and label TITLE drops, kept where Navidrome and Picard read them.
-    subtitle: [kept === full ? null : noteOf(full), title === kept ? null : labelOf(track)].filter(Boolean).join("; ") || null,
+    subtitle: [noteOf(title) ? null : noteOf(full), title === kept ? null : labelOf(track)].filter(Boolean).join("; ") || null,
     artist: track.artist?.name || track.artists?.[0]?.name,
     artists: (track.artists ?? []).map((a) => a.name).filter(Boolean),
     album: albumTitle && shownTitle(albumTitle, names.albums),
@@ -1243,6 +1241,9 @@ const titleMatch = (t, title) => {
   return [full, plainTitle(t)].some((s) => norm(shownTitle(s, [title])) === want) ? 1 : 0;
 };
 
+/** True when both lengths are known and within 3 seconds of each other. */
+const lengthsAgree = (t, track) => !!(t.duration && track.durationMs) && Math.abs(t.duration * 1000 - track.durationMs) <= 3000;
+
 /** True when a Tidal track is the requested recording, so the request's MusicBrainz IDs may be written into it. */
 export function matchesRequest(t, track) {
   const artist = norm(track.artist);
@@ -1252,7 +1253,7 @@ export function matchesRequest(t, track) {
   const known = !!(t.duration && track.durationMs);
   // A stripped title is only trusted when both lengths confirm it.
   if (how === 1 && !known) return false;
-  return !known || Math.abs(t.duration * 1000 - track.durationMs) <= 3000;
+  return !known || lengthsAgree(t, track);
 }
 
 /** The requested artist, whole and split on joiners ("Timbaland Presents OneRepublic" → both). */
@@ -1325,10 +1326,9 @@ async function searchTracks(input) {
     const tier = advertisedTier(t, plan.wanted, plan.hiresCapable);
     if (!tier) continue;
     if (upgrade && !upgrades(plan, tier.tier, upgrade.currentTier)) continue;
-    const lengthsAgree = !!(t.duration && track.durationMs) && Math.abs(t.duration * 1000 - track.durationMs) <= 3000;
     out.push({
       id: String(t.id),
-      title: clip(titleFor(t, [track.title], lengthsAgree)),
+      title: clip(titleFor(t, [track.title], lengthsAgree(t, track))),
       // Aurral splits the credit on commas and matches any name, so a duet matches either artist.
       artist: clip(credit(t, wanted)),
       album: t.album?.title ? clip(shownTitle(t.album.title, [track.album])) : null,
