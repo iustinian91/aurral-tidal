@@ -1,7 +1,7 @@
 {
   "id": "tidal",
   "name": "Tidal",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "api": 1,
   "description": "Downloads tracks and albums from your Tidal account in Hi-Res FLAC, FLAC or AAC 320, with tags, cover art and lyrics written into each file.",
   "uses": ["api.tidal.com", "auth.tidal.com", "login.tidal.com", "resources.tidal.com", "Your Tidal account", "Aurral settings (quality profile)"],
